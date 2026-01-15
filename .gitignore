@@ -1,0 +1,16 @@
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Arduino/PlatformIO
+.pio
+.vscode/
+*.elf
+*.bin
+*.hex
+*.map
+build/
+dist/
+
+# Logs
+*.log
