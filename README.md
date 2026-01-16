@@ -3,10 +3,11 @@
 This project implements a crash detection and logging system using an ESP32 microcontroller and an MPU6050 accelerometer/gyroscope. It hosts a local web server (Access Point mode) that allows you to view real-time status and analyze crash data immediately after an impact.
 
 ## Features
-- **Crash Detection**: Automatically detects impacts > 1.5G.
-- **Data Logging**: Captures 50 samples before and 50 samples after the crash (1 second total window).
-- **Web Interface**: View crash statistics, severity ratings, and an interactive chart of the G-forces.
-- **Scoring System**: "Gamified" crash score based on impact intensity and duration.
+- **High-Speed Sampling**: 500Hz sampling rate (2ms resolution) for capturing precise peak G-forces.
+- **Dynamic Recording**: Captures the full duration of a crash, including bounces, using silence-detection-based "Smart Stop".
+- **Hardware Precision**: Configured for ±16G range to prevent clipping during severe impacts.
+- **Web Interface**: Integrated server serving an interactive dashboard with canvas-based charting and real-time statistics.
+- **Scoring System**: "Gamified" crash score based on peak intensity and duration of high-G impacts.
 
 ## Hardware Requirements
 1.  **ESP32 Development Board**

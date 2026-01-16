@@ -20,25 +20,34 @@ AsyncWebSocket ws("/ws");
 
 // --- Crash Detection Settings ---
 // Adjust these values based on testing for your specific setup
-const float CRASH_THRESHOLD_G = 1.5; // Acceleration magnitude in G's to trigger a crash
-const int PRE_CRASH_SAMPLES = 50;   // Number of samples to store before a crash
-const int POST_CRASH_SAMPLES = 50;  // Number of samples to store after a crash
-const int SAMPLE_RATE_MS = 10;      // Milliseconds between sensor readings
+const float CRASH_THRESHOLD_G = 2.0; // Acceleration magnitude in G's to trigger a crash
+const int PRE_CRASH_SAMPLES = 250;   // Number of samples to keep in circular buffer
+const int MAX_SAMPLES = 500;         // Max total samples (1 second @ 500Hz)
+const int SAMPLE_RATE_MS = 2;        // 500Hz
+const float SILENCE_THRESHOLD_G = 1.5; // G-force below this is considered "silence"
+const int SILENCE_DURATION_MS = 1000; // Stop recording after 1s of silence
+const int SILENCE_SAMPLE_COUNT = SILENCE_DURATION_MS / SAMPLE_RATE_MS;
 
 // --- Data Buffering ---
 struct SensorData {
     float ax, ay, az;
     float gx, gy, gz;
 };
-SensorData dataBuffer[PRE_CRASH_SAMPLES];
-int bufferIndex = 0;
-bool bufferFull = false;
+
+// Global buffers (Heap allocation) to avoid stack overflow
+SensorData preCrashBuffer[PRE_CRASH_SAMPLES]; // Circular buffer for pre-impact data
+SensorData recordingBuffer[MAX_SAMPLES];      // Linear buffer for the full crash event
+int preCrashIndex = 0;
+int recordingIndex = 0;
+int silenceCounter = 0;
+bool preCrashFull = false;
 
 // --- State Management ---
 enum AppState {
     IDLE,
     ARMED,
-    CRASH_DETECTED
+    RECORDING,  // New state for active recording
+    PROCESSING  // State while sending data
 };
 AppState currentState = IDLE;
 
@@ -341,7 +350,7 @@ const char* HTML_CONTENT = R"rawliteral(
                 }
                 
                 // Calculate impact duration (samples above threshold * sample rate)
-                const SAMPLE_RATE_MS = 10;
+                const SAMPLE_RATE_MS = 2;
                 const impactDuration = highGCount * SAMPLE_RATE_MS;
                 
                 // Calculate crash score (peak G * duration factor)
@@ -494,7 +503,7 @@ void setup() {
     }
     Serial.println("MPU6050 Found!");
 
-    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
     Serial.print("Accelerometer range set to: ");
     switch (mpu.getAccelerometerRange()) {
         case MPU6050_RANGE_2_G: Serial.println("+-2G"); break;
@@ -511,7 +520,7 @@ void setup() {
         case MPU6050_RANGE_2000_DEG: Serial.println("+-2000 deg/s"); break;
     }
 
-    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    mpu.setFilterBandwidth(MPU6050_BAND_260_HZ);
     Serial.print("Filter bandwidth set to: ");
     switch (mpu.getFilterBandwidth()) {
         case MPU6050_BAND_260_HZ: Serial.println("260 Hz"); break;
@@ -562,8 +571,8 @@ void loop() {
         if (command == "START") {
             if (currentState != ARMED) {
                 currentState = ARMED;
-                bufferIndex = 0;
-                bufferFull = false;
+                preCrashIndex = 0;
+                preCrashFull = false;
                 Serial.println(">>> System Armed via Serial! Monitoring for crashes...");
                 notifyClients("Armed. Monitoring for crashes.", "status");
             } else {
@@ -581,7 +590,7 @@ void loop() {
             Serial.print(">>> Current State: ");
             if (currentState == IDLE) Serial.println("IDLE");
             else if (currentState == ARMED) Serial.println("ARMED");
-            else if (currentState == CRASH_DETECTED) Serial.println("CRASH_DETECTED");
+            else if (currentState == RECORDING) Serial.println("RECORDING");
         } else if (command == "HELP") {
             Serial.println(">>> Available Commands:");
             Serial.println("    START  - Arm the crash detection system");
@@ -598,48 +607,81 @@ void loop() {
         SensorData currentReading;
         readMPUData(currentReading);
 
-        // Store data in circular buffer
-        dataBuffer[bufferIndex] = currentReading;
-        bufferIndex = (bufferIndex + 1) % PRE_CRASH_SAMPLES;
-        if (bufferIndex == 0) {
-            bufferFull = true;
-        }
-
         if (currentState == ARMED) {
-            float totalAccel = sqrt(
-                pow(currentReading.ax, 2) +
-                pow(currentReading.ay, 2) +
-                pow(currentReading.az, 2)
-            );
-            // Convert m/s^2 to G's (approx 9.80665 m/s^2 per G)
+            // Fill circular pre-crash buffer
+            preCrashBuffer[preCrashIndex] = currentReading;
+            preCrashIndex = (preCrashIndex + 1) % PRE_CRASH_SAMPLES;
+            if (preCrashIndex == 0) preCrashFull = true;
+
+            // Check for Crash Trigger
+            float totalAccel = sqrt(pow(currentReading.ax, 2) + pow(currentReading.ay, 2) + pow(currentReading.az, 2));
             float totalAccelG = totalAccel / SENSORS_GRAVITY_STANDARD;
 
             if (totalAccelG >= CRASH_THRESHOLD_G) {
-                currentState = CRASH_DETECTED;
-                Serial.println("CRASH DETECTED!");
-                notifyClients("CRASH DETECTED!", "status");
+                currentState = RECORDING;
+                Serial.println(">>> CRASH STARTED! Recording...");
+                notifyClients("CRASH DETECTED! Recording...", "status");
 
-                // Collect post-crash samples
-                SensorData crashData[PRE_CRASH_SAMPLES + POST_CRASH_SAMPLES];
-                int dataCounter = 0;
+                // Copy pre-crash buffer to main recording buffer
+                int startIdx = preCrashFull ? preCrashIndex : 0;
+                int count = 0;
+                
+                // If buffer isn't full yet, only copy what we have (though typically it will be full if armed for >0.5s)
+                int itemsToCopy = preCrashFull ? PRE_CRASH_SAMPLES : preCrashIndex;
+                
+                for (int i = 0; i < itemsToCopy; i++) {
+                    recordingBuffer[count++] = preCrashBuffer[(startIdx + i) % PRE_CRASH_SAMPLES];
+                }
+                
+                recordingIndex = count; // Start recording new data after the pre-crash data
+                silenceCounter = 0;
+                
+                // Store the trigger sample too
+                if (recordingIndex < MAX_SAMPLES) {
+                    recordingBuffer[recordingIndex++] = currentReading;
+                }
+            }
+        } 
+        else if (currentState == RECORDING) {
+            // Continually record data
+            if (recordingIndex < MAX_SAMPLES) {
+                recordingBuffer[recordingIndex] = currentReading;
+                
+                // Silence Detection
+                float totalAccel = sqrt(pow(currentReading.ax, 2) + pow(currentReading.ay, 2) + pow(currentReading.az, 2));
+                float totalAccelG = totalAccel / SENSORS_GRAVITY_STANDARD;
 
-                // Add pre-crash data from circular buffer
-                int startIdx = bufferFull ? bufferIndex : 0;
-                for (int i = 0; i < PRE_CRASH_SAMPLES; ++i) {
-                    crashData[dataCounter++] = dataBuffer[(startIdx + i) % PRE_CRASH_SAMPLES];
+                // Reset silence counter if we see significant movement
+                if (totalAccelG > SILENCE_THRESHOLD_G) {
+                    silenceCounter = 0;
+                } else {
+                    silenceCounter++;
                 }
 
-                // Add post-crash data
-                for (int i = 0; i < POST_CRASH_SAMPLES; ++i) {
-                    delay(SAMPLE_RATE_MS); // Maintain sample rate
-                    readMPUData(crashData[dataCounter++]);
+                recordingIndex++;
+                
+                // Stop Logic: Buffer Full OR Long Silence
+                bool stopRecording = false;
+                if (recordingIndex >= MAX_SAMPLES) {
+                    Serial.println(">>> Buffer Full! stopping.");
+                    stopRecording = true;
+                } else if (silenceCounter >= SILENCE_SAMPLE_COUNT) {
+                    Serial.println(">>> Silence detected! stopping.");
+                    stopRecording = true;
                 }
 
-                sendCrashDataToClients(crashData, PRE_CRASH_SAMPLES + POST_CRASH_SAMPLES);
-                printCrashDataToSerial(crashData, PRE_CRASH_SAMPLES + POST_CRASH_SAMPLES);
-                currentState = IDLE; // Reset to idle after sending data
-                notifyClients("Idle. Ready to arm.", "status");
-                Serial.println(">>> System reset to IDLE. Ready to arm again.");
+                if (stopRecording) {
+                    currentState = PROCESSING;
+                    notifyClients("Processing Data...", "status");
+                    Serial.println(">>> Sending Data...");
+                    
+                    sendCrashDataToClients(recordingBuffer, recordingIndex);
+                    printCrashDataToSerial(recordingBuffer, recordingIndex);
+                    
+                    currentState = IDLE;
+                    notifyClients("Idle. Ready to arm.", "status");
+                    Serial.println(">>> System reset to IDLE.");
+                }
             }
         }
     }
@@ -666,8 +708,8 @@ void handleWebSocketEvent(AsyncWebSocket* server, AsyncWebSocketClient* client, 
                 if (msg == "START") {
                     if (currentState != ARMED) {
                         currentState = ARMED;
-                        bufferIndex = 0; // Reset buffer on arming
-                        bufferFull = false;
+                        preCrashIndex = 0; // Reset buffer on arming
+                        preCrashFull = false;
                         Serial.println("System Armed!");
                         notifyClients("Armed. Monitoring for crashes.", "status");
                     } else {
@@ -712,40 +754,38 @@ void readMPUData(SensorData& currentData) {
 
 void sendCrashDataToClients(SensorData* crashData, int numSamples) {
     if (ws.count() == 0) return;
-
-    // Increase buffer size to ensure all float data fits (approx 10-12KB needed)
-    DynamicJsonDocument doc(numSamples * sizeof(SensorData) * 6);
+    // Optimized payload: Round to 2 decimal places to save ~50% message size
+    // 500 samples * 3 axes * ~6 chars = ~9KB. Very safe.
+    DynamicJsonDocument doc(32000); 
     doc["type"] = "crashData";
+    JsonObject dataObj = doc.createNestedObject("data");
 
-    JsonArray ax_array = doc["data"].createNestedArray("ax");
-    JsonArray ay_array = doc["data"].createNestedArray("ay");
-    JsonArray az_array = doc["data"].createNestedArray("az");
-    JsonArray gx_array = doc["data"].createNestedArray("gx");
-    JsonArray gy_array = doc["data"].createNestedArray("gy");
-    JsonArray gz_array = doc["data"].createNestedArray("gz");
+    JsonArray ax_array = dataObj.createNestedArray("ax");
+    JsonArray ay_array = dataObj.createNestedArray("ay");
+    JsonArray az_array = dataObj.createNestedArray("az");
 
     for (int i = 0; i < numSamples; ++i) {
-        ax_array.add(crashData[i].ax);
-        ay_array.add(crashData[i].ay);
-        az_array.add(crashData[i].az);
-        gx_array.add(crashData[i].gx);
-        gy_array.add(crashData[i].gy);
-        gz_array.add(crashData[i].gz);
+        // Rounding to 2 decimal places reduces JSON string length significantly
+        ax_array.add(round(crashData[i].ax * 100.0) / 100.0);
+        ay_array.add(round(crashData[i].ay * 100.0) / 100.0);
+        az_array.add(round(crashData[i].az * 100.0) / 100.0);
     }
 
     String jsonMessage;
     serializeJson(doc, jsonMessage);
+    
+    Serial.print(">>> JSON Generated. Size: ");
+    Serial.print(jsonMessage.length());
+    Serial.println(" bytes.");
+    
     ws.textAll(jsonMessage);
+    Serial.println(">>> Data sent to clients.");
 }
 
 void printCrashDataToSerial(SensorData* crashData, int numSamples) {
     Serial.println("\n========== CRASH DATA ==========");
     Serial.print("Total samples: ");
     Serial.println(numSamples);
-    Serial.print("Pre-crash samples: ");
-    Serial.println(PRE_CRASH_SAMPLES);
-    Serial.print("Post-crash samples: ");
-    Serial.println(POST_CRASH_SAMPLES);
     Serial.println("\nSample | Accel X | Accel Y | Accel Z | Gyro X | Gyro Y | Gyro Z");
     Serial.println("-------|---------|---------|---------|--------|--------|--------");
     
@@ -763,7 +803,7 @@ void printCrashDataToSerial(SensorData* crashData, int numSamples) {
         
         // Mark the crash point (between pre and post samples)
         if (i == PRE_CRASH_SAMPLES - 1) {
-            Serial.println("------- CRASH POINT -------");
+            Serial.println("------- CRASH TRIGGER -------");
         }
     }
     Serial.println("================================\n");
